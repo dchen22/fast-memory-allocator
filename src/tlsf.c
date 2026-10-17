@@ -234,6 +234,97 @@ void* tlsf_malloc(uint32_t n)
     return (char*)pClaimedHeader + sizeof(BlockHeader);
 }
 
+void* tlsf_realloc(void *ptr, uint32_t newSize)
+{
+    BlockHeader* pCurrHeader = (BlockHeader*)((char*)ptr - sizeof(BlockHeader));
+    uint32_t need = (uint32_t)align(newSize + 2 * sizeof(BlockHeader));
+
+    if (need == pCurrHeader->size)   // No resize, do nothing
+    {
+        return ptr;
+    }
+
+    BlockHeader* pCurrFooter = (BlockHeader*)((char*)pCurrHeader + pCurrHeader->size - sizeof(BlockHeader));
+
+    /* Is this a shrinking resize? */
+    if (need < pCurrHeader->size)
+    {
+        /* 
+        Break current block into two: kept block (newSize)
+        and a tail block */
+
+        // Is the leftover tail block big enough to be a new block?
+        if (pCurrHeader->size - need >= 2 * sizeof(BlockHeader))
+        {
+            // Set up tail block
+            BlockHeader* pTailHeader = (BlockHeader*)((char*)pCurrHeader + need);
+            pTailHeader->size = pCurrHeader->size - need;
+            pTailHeader->prev = NULL;
+            pTailHeader->next = NULL;
+            pTailHeader->isFree = true;
+            BlockHeader* pTailFooter = (BlockHeader*)((char*)pTailHeader + pTailHeader->size - sizeof(BlockHeader));
+            memcpy(pTailFooter, pTailHeader, sizeof(BlockHeader));
+
+            // Update current block
+            BlockHeader* pCurrFooter = (BlockHeader*)((char*)pCurrHeader + need - sizeof(BlockHeader));
+            pCurrHeader->size = need;
+            memcpy(pCurrFooter, pCurrHeader, sizeof(BlockHeader));
+        
+            tlsf_free(pTailHeader + 1);
+        }
+        else
+        {
+            // do nothing
+        }
+    } 
+    else    // Enlargening resize 
+    {
+        /* Check if we can simply carve out of right neighbour 
+        (right neighbour leftover becomes 'tail')
+        */
+        BlockHeader* pRightHeader = pCurrFooter + 1;
+        if (true == isHeaderInPoolRange(pRightHeader) 
+            && true == pRightHeader->isFree
+            && need <= pCurrHeader->size + pRightHeader->size)
+        {
+            uint32_t leftover = pCurrHeader->size + pRightHeader->size - need;
+            // Move right free neighbour to possibly new free grid position
+            uint32_t fl, sl;
+            getLayerIndicesFromBlockSize(pRightHeader->size, &fl, &sl);
+            popBlockHeaderNode(fl, sl, pRightHeader);
+            BlockHeader* pRightFooter = (BlockHeader*)((char*)pRightHeader + pRightHeader->size - sizeof(BlockHeader));
+
+            // We can carve out of right, but keep it as a free block
+            if (leftover >= 2 * sizeof(BlockHeader))
+            {
+                // Change right neighbour (becomes 'tail'), now that we've carved it
+                BlockHeader* pNewRightHeader = (BlockHeader*)((char*)pCurrHeader + need);
+                pNewRightHeader->size = leftover;
+                memcpy(pRightFooter, pNewRightHeader, sizeof(BlockHeader));
+                
+                insert_free_block(pNewRightHeader);
+
+                // Update current block
+                pCurrHeader->size = need;
+                BlockHeader* pNewCurrFooter = (BlockHeader*)((char*)pCurrHeader + need - sizeof(BlockHeader));
+                memcpy(pNewCurrFooter, pCurrHeader, sizeof(BlockHeader));
+            
+            }
+            else    // Carve would leave right neighbour too small. Merge with right neighbour completely
+            {
+                pCurrHeader->size = pCurrHeader->size + pRightHeader->size;
+                memcpy(pRightFooter, pCurrHeader, sizeof(BlockHeader));
+            }
+        }
+        else
+        {
+            // Todo: some zero copy page table remap magic
+        }
+    }
+
+    return ptr;
+}
+
 void tlsf_free(void *ptr)
 {
     if (NULL == ptr)
