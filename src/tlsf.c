@@ -22,6 +22,8 @@ typedef struct TlsfGlobal {
     char* pool;
     uint32_t poolSize;
     BlockHeader* free_grid[FL_SIZE][SL_SIZE];
+    uint32_t firstLayerBitmap;
+    uint32_t secondLayerBitmap[FL_SIZE];
 } TlsfGlobal;
 
 void getLayerIndicesFromBlockSize(
@@ -45,7 +47,7 @@ int tlsf_init(void)
     {
         munmap(tlsf.pool, tlsf.poolSize);
     }
-    memset(&tlsf, 0, sizeof tlsf);
+    memset(&tlsf, 0, sizeof(tlsf));
 
     void *pool = mmap(NULL, POOL_SIZE,
                     PROT_READ | PROT_WRITE,
@@ -119,6 +121,10 @@ void insert_free_block(BlockHeader* block)
 
     block->isFree = true;
 
+    // update bitmaps
+    tlsf.firstLayerBitmap |= 1u << fl;
+    tlsf.secondLayerBitmap[fl] |= 1u << sl;
+
     BlockHeader* pFooter = (BlockHeader*)((char*)block + block->size - sizeof(BlockHeader));
     memcpy(pFooter, block, sizeof(BlockHeader));
 }
@@ -132,8 +138,13 @@ static uint32_t bandLowerBound(uint32_t fl, uint32_t sl)
 }
 
 /* 
-Find first free block of the first band with free blocks guaranteed to fit <size>.
-Also get grid index of this band.
+Find first free block of the first safe band
+
+A safe band is a band for block sizes [low, high) where 
+<size> <= low. This means any block in that band can accomodate our
+desired size. 
+
+Also get the grid index of this band.
 
 E.g. if size=50 and bands are 46-49, 48-51, 52-55,
 the 48-51 band fits 50 but 52-55 blocks are guaranteed to fit 50.
@@ -147,23 +158,59 @@ BlockHeader* findLargeEnoughFreeBlock(
     uint32_t fl = 0, sl = 0;
     getLayerIndicesFromBlockSize(size, &fl, &sl);
 
-    /* Insert mapping can land in a band whose lower bound is still < size
-       (e.g. 50 sits in 48–55). Skip any such band; do not walk its list.
-       Later this scan becomes a bitmap/ctz jump. */
-    for (uint32_t i = fl; i < FL_SIZE; i++)
+    /* 
+    Find first safe band (uses nested for loop but is at most 2
+    iterations)
+    */
+
+    // If (fl, sl) is not a safe band, start at immediate next band
+    if (bandLowerBound(fl, sl) < size)  
     {
-        uint32_t j0 = (i == fl) ? sl : 0;
-        for (uint32_t j = j0; j < SL_SIZE; j++)
+        if (sl < SL_SIZE - 1)   // More bands in this FL row 
         {
-            if (NULL != tlsf.free_grid[i][j] && bandLowerBound(i, j) >= size)
+            sl++;
+        }
+        else
+        {
+            if (fl < FL_SIZE - 1)   // More FL rows
             {
-                *found_fl = i;
-                *found_sl = j;
-                return tlsf.free_grid[i][j];
+                fl++;
+                sl = 0;
+            }
+            else    // Reached the biggest band and still can't fit
+            {
+                return NULL;
             }
         }
     }
-    return NULL;
+
+    /* Check if the safe band's row has a free block, starting
+    at the free band
+    */
+    for (uint32_t i = sl; i < SL_SIZE; i++)
+    {
+        if (NULL != tlsf.free_grid[fl][i])
+        {
+            *found_fl = fl;
+            *found_sl = i;
+            return tlsf.free_grid[fl][i];
+        }
+    }
+
+    /* Safe band row doesn't have free block. 
+    Do bitmap search to find next row with a free block */
+    uint32_t flMask = (~((1u << fl) - 1)) << 1; // only bits after fl-th bit 
+    uint32_t firstLayerBitmapMasked = tlsf.firstLayerBitmap & flMask;    
+    if (0 == firstLayerBitmapMasked)    // Nothing free
+    {
+        return NULL;
+    }
+    uint32_t availableFl = __builtin_ctz(firstLayerBitmapMasked);   // First FL row with free block
+    uint32_t availableSl = __builtin_ctz(tlsf.secondLayerBitmap[availableFl]);
+    
+    *found_fl = availableFl;
+    *found_sl = availableSl;
+    return tlsf.free_grid[availableFl][availableSl];
 }
 
 void* tlsf_malloc(uint32_t n)
@@ -183,14 +230,7 @@ void* tlsf_malloc(uint32_t n)
     }
 
     /* Pop this free block */
-    tlsf.free_grid[found_fl][found_sl] = pClaimedHeader->next;
-    if (NULL != pClaimedHeader->next)
-    {
-        pClaimedHeader->next->prev = NULL;
-    }
-    pClaimedHeader->prev = NULL;
-    pClaimedHeader->next = NULL;
-    pClaimedHeader->isFree = false;
+    popBlockHeaderNode(found_fl, found_sl, pClaimedHeader);
 
     /* Split: 
     We claim <need> bytes from the free block. Is the leftover large
@@ -407,6 +447,8 @@ Assumes <node> is an element of the list
 */
 void popBlockHeaderNode( uint32_t fl, uint32_t sl, BlockHeader* node)
 {
+    node->isFree = false;
+
     /* Is this node the head? */
     if (NULL == node->prev)
     {
@@ -415,6 +457,15 @@ void popBlockHeaderNode( uint32_t fl, uint32_t sl, BlockHeader* node)
         if (NULL != node->next)
         {
             node->next->prev = NULL;
+        }
+        else // Grid is empty now
+        {
+            // Update bitmaps
+            tlsf.secondLayerBitmap[fl] &= ~(1u << sl);
+            if (0 == tlsf.secondLayerBitmap[fl])
+            {
+                tlsf.firstLayerBitmap &= ~(1u << fl);
+            }
         }
         
         node->next = NULL;
