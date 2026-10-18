@@ -318,7 +318,20 @@ void* tlsf_realloc(void *ptr, uint32_t newSize)
         }
         else
         {
-            // Todo: some zero copy page table remap magic
+            /* Run tlsf_malloc(newSize), copy bytes, and free this block */
+            char* pNewlyClaimedSpace = tlsf_malloc(newSize);
+            if (NULL == pNewlyClaimedSpace)
+            {
+                return NULL;
+            }
+
+            // Copy bytes over
+            memcpy(pNewlyClaimedSpace, pCurrHeader + 1, pCurrHeader->size - 2 * sizeof(BlockHeader));
+
+            // Free this region
+            tlsf_free(pCurrHeader + 1);
+
+            return pNewlyClaimedSpace;
         }
     }
 

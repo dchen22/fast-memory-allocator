@@ -5,6 +5,7 @@
 
 int tlsf_init(void);
 void *tlsf_malloc(uint32_t n);
+void *tlsf_realloc(void *ptr, uint32_t newSize);
 void tlsf_free(void *ptr);
 
 #endif
